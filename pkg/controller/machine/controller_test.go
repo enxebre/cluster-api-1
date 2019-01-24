@@ -17,123 +17,155 @@ limitations under the License.
 package machine
 
 import (
-	"strconv"
-	"sync"
+	"reflect"
 	"testing"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1/testutil"
-	"sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-func machineControllerReconcile(t *testing.T, cs *clientset.Clientset, controller *MachineController) {
-	instance := v1alpha1.Machine{}
-	instance.Name = "instance-1"
-	expectedKey := "default/instance-1"
-
-	// When creating a new object, it should invoke the reconcile method.
-	cluster := testutil.GetVanillaCluster()
-	cluster.Name = "cluster-1"
-	clusterClient := cs.ClusterV1alpha1().Clusters("default")
-	if _, err := clusterClient.Create(&cluster); err != nil {
-		t.Fatal(err)
+func TestReconcileRequest(t *testing.T) {
+	machine1 := v1alpha1.Machine{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Machine",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "create",
+			Namespace:  "default",
+			Finalizers: []string{v1alpha1.MachineFinalizer},
+		},
 	}
-	defer clusterClient.Delete(cluster.Name, &metav1.DeleteOptions{})
-
-	client := cs.ClusterV1alpha1().Machines("default")
-	before := make(chan struct{})
-	after := make(chan struct{})
-	var aftOnce, befOnce sync.Once
-
-	actualKey := ""
-	var actualErr error = nil
-
-	// Setup test callbacks to be called when the message is reconciled.
-	// Sometimes reconcile is called multiple times, so use Once to prevent closing the channels again.
-	controller.BeforeReconcile = func(key string) {
-		actualKey = key
-		befOnce.Do(func() { close(before) })
+	machine2 := v1alpha1.Machine{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Machine",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "update",
+			Namespace:  "default",
+			Finalizers: []string{v1alpha1.MachineFinalizer},
+		},
 	}
-	controller.AfterReconcile = func(key string, err error) {
-		actualKey = key
-		actualErr = err
-		aftOnce.Do(func() { close(after) })
+	time := metav1.Now()
+	machine3 := v1alpha1.Machine{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Machine",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "delete",
+			Namespace:         "default",
+			Finalizers:        []string{v1alpha1.MachineFinalizer},
+			DeletionTimestamp: &time,
+		},
+	}
+	clusterList := v1alpha1.ClusterList{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "ClusterList",
+		},
+		Items: []v1alpha1.Cluster{
+			{
+				TypeMeta: metav1.TypeMeta{
+					Kind: "Cluster",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cluster",
+					Namespace: "default",
+				},
+			},
+		},
 	}
 
-	// Create an instance
-	if _, err := client.Create(&instance); err != nil {
-		t.Fatal(err)
+	type expected struct {
+		createCallCount int64
+		existCallCount  int64
+		updateCallCount int64
+		deleteCallCount int64
+		result          reconcile.Result
+		error           bool
 	}
-	defer client.Delete(instance.Name, &metav1.DeleteOptions{})
+	testCases := []struct {
+		request     reconcile.Request
+		existsValue bool
+		expected    expected
+	}{
+		{
+			request: reconcile.Request{NamespacedName: types.NamespacedName{Name: machine1.Name, Namespace: machine1.Namespace}},
+			expected: expected{
+				createCallCount: 1,
+				existCallCount:  1,
+				updateCallCount: 0,
+				deleteCallCount: 0,
+				result:          reconcile.Result{},
+				error:           false,
+			},
+		},
+		{
+			request:     reconcile.Request{NamespacedName: types.NamespacedName{Name: machine2.Name, Namespace: machine2.Namespace}},
+			existsValue: true,
+			expected: expected{
+				createCallCount: 0,
+				existCallCount:  1,
+				updateCallCount: 1,
+				deleteCallCount: 0,
+				result:          reconcile.Result{},
+				error:           false,
+			},
+		},
+		{
+			request:     reconcile.Request{NamespacedName: types.NamespacedName{Name: machine3.Name, Namespace: machine3.Namespace}},
+			existsValue: true,
+			expected: expected{
+				createCallCount: 0,
+				existCallCount:  0,
+				updateCallCount: 0,
+				deleteCallCount: 1,
+				result:          reconcile.Result{},
+				error:           false,
+			},
+		},
+	}
 
-	// Verify reconcile function is called against the correct key
-	select {
-	case <-before:
-		if actualKey != expectedKey {
-			t.Fatalf(
-				"Reconcile function was not called with the correct key.\nActual:\t%+v\nExpected:\t%+v",
-				actualKey, expectedKey)
+	for _, tc := range testCases {
+		act := newTestActuator()
+		act.ExistsValue = tc.existsValue
+		v1alpha1.AddToScheme(scheme.Scheme)
+		r := &ReconcileMachine{
+			Client:   fake.NewFakeClient(&clusterList, &machine1, &machine2, &machine3),
+			scheme:   scheme.Scheme,
+			actuator: act,
 		}
-		if actualErr != nil {
-			t.Fatal(actualErr)
+
+		result, err := r.Reconcile(tc.request)
+		gotError := (err != nil)
+		if tc.expected.error != gotError {
+			var errorExpectation string
+			if !tc.expected.error {
+				errorExpectation = "no"
+			}
+			t.Errorf("Case: %s. Expected %s error, got: %v", tc.request.Name, errorExpectation, err)
 		}
-	case <-time.After(time.Second * 2):
-		t.Fatalf("reconcile never called")
-	}
 
-	select {
-	case <-after:
-		if actualKey != expectedKey {
-			t.Fatalf(
-				"Reconcile function was not called with the correct key.\nActual:\t%+v\nExpected:\t%+v",
-				actualKey, expectedKey)
+		if !reflect.DeepEqual(result, tc.expected.result) {
+			t.Errorf("Case %s. Got: %v, expected %v", tc.request.Name, result, tc.expected.result)
 		}
-		if actualErr != nil {
-			t.Fatal(actualErr)
+
+		if act.CreateCallCount != tc.expected.createCallCount {
+			t.Errorf("Case %s. Got: %d createCallCount, expected %d", tc.request.Name, act.CreateCallCount, tc.expected.createCallCount)
 		}
-	case <-time.After(time.Second * 2):
-		t.Fatalf("reconcile never finished")
-	}
-}
 
-func machineControllerConcurrentReconcile(t *testing.T, cs *clientset.Clientset,
-	controller *MachineController) {
-	// Create a cluster object.
-	cluster := testutil.GetVanillaCluster()
-	cluster.Name = "cluster-1"
-	clusterClient := cs.ClusterV1alpha1().Clusters("default")
-	if _, err := clusterClient.Create(&cluster); err != nil {
-		t.Fatal(err)
-	}
-	defer clusterClient.Delete(cluster.Name, &metav1.DeleteOptions{})
-
-	client := cs.ClusterV1alpha1().Machines("default")
-
-	// Direct test actutaor to block on Create() call.
-	ta := controller.controller.actuator.(*TestActuator)
-	ta.BlockOnCreate = true
-	ta.CreateCallCount = 0
-	defer ta.Unblock()
-
-	// Create a few instances
-	const numMachines = 5
-	for i := 0; i < numMachines; i++ {
-		instance := v1alpha1.Machine{}
-		instance.Name = "instance" + strconv.Itoa(i)
-		if _, err := client.Create(&instance); err != nil {
-			t.Fatal(err)
+		if act.UpdateCallCount != tc.expected.updateCallCount {
+			t.Errorf("Case %s. Got: %d updateCallCount, expected %d", tc.request.Name, act.UpdateCallCount, tc.expected.updateCallCount)
 		}
-	}
 
-	err := wait.Poll(time.Second, 10*time.Second, func() (bool, error) {
-		return (ta.CreateCallCount == numMachines), nil
-	})
+		if act.ExistsCallCount != tc.expected.existCallCount {
+			t.Errorf("Case %s. Got: %d existCallCount, expected %d", tc.request.Name, act.ExistsCallCount, tc.expected.existCallCount)
+		}
 
-	if err != nil {
-		t.Fatalf("The reconcilation didn't run in parallel.")
+		if act.DeleteCallCount != tc.expected.deleteCallCount {
+			t.Errorf("Case %s. Got: %d deleteCallCount, expected %d", tc.request.Name, act.DeleteCallCount, tc.expected.deleteCallCount)
+		}
 	}
 }

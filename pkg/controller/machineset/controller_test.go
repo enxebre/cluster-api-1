@@ -14,89 +14,241 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package machineset_test
+package machineset
 
 import (
-	"sync"
+	"reflect"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1/testutil"
-	"sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
-	"sigs.k8s.io/cluster-api/pkg/controller/machineset"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-func machineSetControllerReconcile(t *testing.T, cs *clientset.Clientset, controller *machineset.MachineSetController) {
-	instance := v1alpha1.MachineSet{}
-	instance.Name = "instance-1"
-	replicas := int32(0)
-	instance.Spec.Replicas = &replicas
-	instance.Spec.Selector = metav1.LabelSelector{MatchLabels: map[string]string{"foo": "barr"}}
-	instance.Spec.Template.Labels = map[string]string{"foo": "barr"}
-
-	expectedKey := "default/instance-1"
-
-	// When creating a new object, it should invoke the reconcile method.
-	cluster := testutil.GetVanillaCluster()
-	cluster.Name = "cluster-1"
-	if _, err := cs.ClusterV1alpha1().Clusters("default").Create(&cluster); err != nil {
-		t.Fatal(err)
+func TestMachineSetToMachines(t *testing.T) {
+	machineSetList := &v1alpha1.MachineSetList{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "MachineSetList",
+		},
+		Items: []v1alpha1.MachineSet{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "withMatchingLabels",
+					Namespace: "test",
+				},
+				Spec: v1alpha1.MachineSetSpec{
+					Selector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"foo": "bar",
+						},
+					},
+				},
+			},
+		},
 	}
-	client := cs.ClusterV1alpha1().MachineSets("default")
-	before := make(chan struct{})
-	after := make(chan struct{})
-	var aftOnce, befOnce sync.Once
-
-	actualKey := ""
-	var actualErr error = nil
-
-	// Setup test callbacks to be called when the message is reconciled.
-	// Sometimes reconcile is called multiple times, so use Once to prevent closing the channels again.
-	controller.BeforeReconcile = func(key string) {
-		actualKey = key
-		befOnce.Do(func() { close(before) })
+	controller := true
+	m := v1alpha1.Machine{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Machine",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "withOwnerRef",
+			Namespace: "test",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       "Owner",
+					Kind:       "MachineSet",
+					Controller: &controller,
+				},
+			},
+		},
 	}
-	controller.AfterReconcile = func(key string, err error) {
-		actualKey = key
-		actualErr = err
-		aftOnce.Do(func() { close(after) })
+	m2 := v1alpha1.Machine{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Machine",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "noOwnerRefNoLabels",
+			Namespace: "test",
+		},
+	}
+	m3 := v1alpha1.Machine{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Machine",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "withMatchingLabels",
+			Namespace: "test",
+			Labels: map[string]string{
+				"foo": "bar",
+			},
+		},
+	}
+	testsCases := []struct {
+		machine   v1alpha1.Machine
+		mapObject handler.MapObject
+		expected  []reconcile.Request
+	}{
+		{
+			machine: m,
+			mapObject: handler.MapObject{
+				Meta:   m.GetObjectMeta(),
+				Object: &m,
+			},
+			expected: []reconcile.Request{},
+		},
+		{
+			machine: m2,
+			mapObject: handler.MapObject{
+				Meta:   m2.GetObjectMeta(),
+				Object: &m2,
+			},
+			expected: nil,
+		},
+		{
+			machine: m3,
+			mapObject: handler.MapObject{
+				Meta:   m3.GetObjectMeta(),
+				Object: &m3,
+			},
+			expected: []reconcile.Request{
+				{NamespacedName: client.ObjectKey{Namespace: "test", Name: "withMatchingLabels"}},
+			},
+		},
 	}
 
-	// Create an instance
-	if _, err := client.Create(&instance); err != nil {
-		t.Fatal(err)
+	v1alpha1.AddToScheme(scheme.Scheme)
+	r := &ReconcileMachineSet{
+		Client: fake.NewFakeClient(&m, &m2, &m3, machineSetList),
+		scheme: scheme.Scheme,
 	}
-	defer client.Delete(instance.Name, &metav1.DeleteOptions{})
 
-	// Verify reconcile function is called against the correct key
-	select {
-	case <-before:
-		if actualKey != expectedKey {
-			t.Fatalf(
-				"Reconcile function was not called with the correct key.\nActual:\t%+v\nExpected:\t%+v",
-				actualKey, expectedKey)
+	for _, tc := range testsCases {
+		got := r.MachineToMachineSets(tc.mapObject)
+		if !reflect.DeepEqual(got, tc.expected) {
+			t.Errorf("Case %s. Got: %v, expected: %v", tc.machine.Name, got, tc.expected)
 		}
-		if actualErr != nil {
-			t.Fatal(actualErr)
-		}
-	case <-time.After(time.Second * 2):
-		t.Fatalf("reconcile never called")
+	}
+}
+
+func TestShouldExcludeMachine(t *testing.T) {
+	controller := true
+	testCases := []struct {
+		machineSet v1alpha1.MachineSet
+		machine    v1alpha1.Machine
+		expected   bool
+	}{
+		{
+			machineSet: v1alpha1.MachineSet{},
+			machine: v1alpha1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "withNoMatchingOwnerRef",
+					Namespace: "test",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name:       "Owner",
+							Kind:       "MachineSet",
+							Controller: &controller,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			machineSet: v1alpha1.MachineSet{
+				Spec: v1alpha1.MachineSetSpec{
+					Selector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"foo": "bar",
+						},
+					},
+				},
+			},
+			machine: v1alpha1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "withMatchingLabels",
+					Namespace: "test",
+					Labels: map[string]string{
+						"foo": "bar",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			machineSet: v1alpha1.MachineSet{},
+			machine: v1alpha1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "withDeletionTimestamp",
+					Namespace:         "test",
+					DeletionTimestamp: &metav1.Time{Time: time.Now()},
+					Labels: map[string]string{
+						"foo": "bar",
+					},
+				},
+			},
+			expected: true,
+		},
 	}
 
-	select {
-	case <-after:
-		if actualKey != expectedKey {
-			t.Fatalf(
-				"Reconcile function was not called with the correct key.\nActual:\t%+v\nExpected:\t%+v",
-				actualKey, expectedKey)
+	for _, tc := range testCases {
+		got := shouldExcludeMachine(&tc.machineSet, &tc.machine)
+		if got != tc.expected {
+			t.Errorf("Case %s. Got: %v, expected: %v", tc.machine.Name, got, tc.expected)
 		}
-		if actualErr != nil {
-			t.Fatal(actualErr)
+	}
+}
+
+func TestAdoptOrphan(t *testing.T) {
+	m := v1alpha1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "orphanMachine",
+		},
+	}
+	ms := v1alpha1.MachineSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "adoptOrphanMachine",
+		},
+	}
+	controller := true
+	blockOwnerDeletion := true
+	testCases := []struct {
+		machineSet v1alpha1.MachineSet
+		machine    v1alpha1.Machine
+		expected   []metav1.OwnerReference
+	}{
+		{
+			machine:    m,
+			machineSet: ms,
+			expected: []metav1.OwnerReference{
+				{
+					APIVersion:         v1alpha1.SchemeGroupVersion.String(),
+					Kind:               "MachineSet",
+					Name:               "adoptOrphanMachine",
+					UID:                "",
+					Controller:         &controller,
+					BlockOwnerDeletion: &blockOwnerDeletion,
+				},
+			},
+		},
+	}
+
+	v1alpha1.AddToScheme(scheme.Scheme)
+	r := &ReconcileMachineSet{
+		Client: fake.NewFakeClient(&m),
+		scheme: scheme.Scheme,
+	}
+	for _, tc := range testCases {
+		r.adoptOrphan(&tc.machineSet, &tc.machine)
+		got := tc.machine.GetOwnerReferences()
+		if !reflect.DeepEqual(got, tc.expected) {
+			t.Errorf("Case %s. Got: %+v, expected: %+v", tc.machine.Name, got, tc.expected)
 		}
-	case <-time.After(time.Second * 2):
-		t.Fatalf("reconcile never finished")
 	}
 }

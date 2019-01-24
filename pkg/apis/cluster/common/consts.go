@@ -25,7 +25,7 @@ const (
 	// is not supported by this cluster. This is not a transient error, but
 	// indicates a state that must be fixed before progress can be made.
 	//
-	// Example: the ProviderConfig specifies an instance type that doesn't exist,
+	// Example: the ProviderSpec specifies an instance type that doesn't exist,
 	InvalidConfigurationMachineError MachineStatusError = "InvalidConfiguration"
 
 	// This indicates that the MachineSpec has been updated in a way that
@@ -58,6 +58,15 @@ const (
 	//
 	// Example: cannot resolve EC2 IP address.
 	DeleteMachineError MachineStatusError = "DeleteError"
+
+	// This error indicates that the machine did not join the cluster
+	// as a new node within the expected timeframe after instance
+	// creation at the provider succeeded
+	//
+	// Example use case: A controller that deletes Machines which do
+	// not result in a Node joining the cluster within a given timeout
+	// and that are managed by a MachineSet
+	JoinClusterTimeoutMachineError = "JoinClusterTimeoutError"
 )
 
 type ClusterStatusError string
@@ -85,32 +94,6 @@ const (
 	DeleteClusterError ClusterStatusError = "DeleteError"
 )
 
-// The MachineRole indicates the purpose of the Machine, and will determine
-// what software and configuration will be used when provisioning and managing
-// the Machine. A single Machine may have more than one role, and the list and
-// definitions of supported roles is expected to evolve over time.
-//
-// Currently, only two roles are supported: Master and Node. In the future, we
-// expect user needs to drive the evolution and granularity of these roles,
-// with new additions accommodating common cluster patterns, like dedicated
-// etcd Machines.
-//
-//                 +-----------------------+------------------------+
-//                 | Master present        | Master absent          |
-// +---------------+-----------------------+------------------------|
-// | Node present: | Install control plane | Join the cluster as    |
-// |               | and be schedulable    | just a node            |
-// |---------------+-----------------------+------------------------|
-// | Node absent:  | Install control plane | Invalid configuration  |
-// |               | and be unscheduleable |                        |
-// +---------------+-----------------------+------------------------+
-type MachineRole string
-
-const (
-	MasterRole MachineRole = "Master"
-	NodeRole   MachineRole = "Node"
-)
-
 type MachineSetStatusError string
 
 const (
@@ -118,7 +101,7 @@ const (
 	// is not supported by this cluster. This is not a transient error, but
 	// indicates a state that must be fixed before progress can be made.
 	//
-	// Example: the ProviderConfig specifies an instance type that doesn't exist.
+	// Example: the ProviderSpec specifies an instance type that doesn't exist.
 	InvalidConfigurationMachineSetError MachineSetStatusError = "InvalidConfiguration"
 )
 
@@ -126,6 +109,6 @@ type MachineDeploymentStrategyType string
 
 const (
 	// Replace the old MachineSet by new one using rolling update
-	// i.e gradually scale down the old MachineSet and scale up the new one.
+	// i.e. gradually scale down the old MachineSet and scale up the new one.
 	RollingUpdateMachineDeploymentStrategyType MachineDeploymentStrategyType = "RollingUpdate"
 )

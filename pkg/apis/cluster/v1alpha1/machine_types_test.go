@@ -14,78 +14,53 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1_test
+package v1alpha1
 
 import (
 	"reflect"
 	"testing"
 
+	"golang.org/x/net/context"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	"sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
+	"k8s.io/apimachinery/pkg/types"
 )
 
-func crudAccessToMachineClient(t *testing.T, cs *clientset.Clientset) {
-	instance := v1alpha1.Machine{}
-	instance.Name = "instance-1"
+func TestStorageMachine(t *testing.T) {
+	key := types.NamespacedName{Name: "foo", Namespace: "default"}
+	created := &Machine{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"}}
 
-	expected := instance
-
-	// When sending a storage request for a valid config,
-	// it should provide CRUD access to the object.
-	client := cs.ClusterV1alpha1().Machines("machine-test-valid")
-
-	// Test that the create request returns success.
-	actual, err := client.Create(&instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Delete(instance.Name, &metav1.DeleteOptions{})
-	if !reflect.DeepEqual(actual.Spec, expected.Spec) {
-		t.Fatalf(
-			"Default fields were not set correctly.\nActual:\t%+v\nExpected:\t%+v",
-			actual.Spec, expected.Spec)
+	// Test Create
+	fetched := &Machine{}
+	if err := c.Create(context.TODO(), created); err != nil {
+		t.Errorf("error creating machine: %v", err)
 	}
 
-	// Test getting the created item for list requests.
-	result, err := client.List(metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
+	if err := c.Get(context.TODO(), key, fetched); err != nil {
+		t.Errorf("error getting machine: %v", err)
 	}
-	if itemLength := len(result.Items); itemLength != 1 {
-		t.Fatalf("Number of items in Items list should be 1, but is %d.", itemLength)
-	}
-	if resultSpec := result.Items[0].Spec; !reflect.DeepEqual(resultSpec, expected.Spec) {
-		t.Fatalf(
-			"Item returned from list is not equal to the expected item.\nActual:\t%+v\nExpected:\t%+v",
-			resultSpec, expected.Spec)
+	if !reflect.DeepEqual(*fetched, *created) {
+		t.Error("fetched value not what was created")
 	}
 
-	// Test getting the created item for get requests.
-	actual, err = client.Get(instance.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(actual.Spec, expected.Spec) {
-		t.Fatalf(
-			"Item returned from get is not equal to the expected item.\nActual:\t%+v\nExpected:\t%+v",
-			actual.Spec, expected.Spec)
+	// Test Updating the Labels
+	updated := fetched.DeepCopy()
+	updated.Labels = map[string]string{"hello": "world"}
+	if err := c.Update(context.TODO(), updated); err != nil {
+		t.Errorf("error updating machine: %v", err)
 	}
 
-	// Test deleting the item for delete requests.
-	actual.Finalizers = nil
-	if _, updateErr := client.Update(actual); updateErr != nil {
-		t.Fatal(updateErr)
+	if err := c.Get(context.TODO(), key, fetched); err != nil {
+		t.Errorf("error getting machine: %v", err)
 	}
-	if deleteErr := client.Delete(instance.Name, &metav1.DeleteOptions{}); deleteErr != nil {
-		t.Fatal(deleteErr)
+	if !reflect.DeepEqual(*fetched, *updated) {
+		t.Error("fetched value not what was updated")
 	}
-	result, err = client.List(metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
+
+	// Test Delete
+	if err := c.Delete(context.TODO(), fetched); err != nil {
+		t.Errorf("error deleting machine: %v", err)
 	}
-	if itemLength := len(result.Items); itemLength != 0 {
-		t.Fatalf("Number of items in Items list should be 0, but is %d.", itemLength)
+	if err := c.Get(context.TODO(), key, fetched); err == nil {
+		t.Error("expected error getting machine")
 	}
 }
